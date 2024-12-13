@@ -1,0 +1,596 @@
+---
+title: "English Premier League Machine Learning"
+author: "Holden Ellis"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(stringr)
+library(forcats)
+library(tidymodels)
+library(vip)
+```
+
+# Introduction
+
+The English Premier League is made up of the top 20 football (refered to in America as soccer) teams in England and Wales. The format of this league is very simple, each team plays every other team twice, once at home and once away with no playoffs. Matches can end with one team winning and getting three points, but they can also end in a draw where both teams get one point. At the end of the season, the team with the most points is the league champion, the top four teams qualify for the European Champions League, the fifth place team qualifies for the second tier Europa League, and the bottom three teams are "relegated" to the second tier of English football and replaced by the three best teams from that tier. These outcomes can make the difference between a team going bankrupt and making tens of millions of dollars, so predicting match outcomes is essential for investors and sponsors.   
+
+On top of this, sports betting is a massive industry. In the US, it brought in in over 14.3 billion dollars in 2024 despite not being legal in many states^1^. In the UK, where it is legal to bet on match results, it earned 4.2 billion dollars^2^. For bookmakers, accurately determining odds is paramount to maintaining business and for betters, knowing when they can beat these odds is paramount to making any money.
+
+This leads to the research question:
+Is it possible to use a machine learning model to gain a predictive advantage over bookmakers for the English Premier League?
+
+# Data Collection
+
+My initial dataset was the match odds for every Premier League feature since the start of the 2012-13 season^3^. From here I wrote a Python program to scrape match results, attendance figures and end-of-season tables from fbref.com^4^. I loaded this data into a separate program that created objects for games and teams and used that to write the data file with previous results, `tmp3.csv`. Additionally, I used the league tables from the start of each match day^5^ to determine if a match was significant to each team's league placement. Below I join the previous season statistics, `home_adv.csv` and `attendance.csv`, as well as self-joining the previous match result.
+
+```{r load data}
+matches <- read.csv("tmp3.csv")
+home_adv <- read.csv("home_strength.csv")
+attendance <- read.csv("attendance.csv")
+
+#note: manually shifted seasons forward one so that it joins realistically
+#i.e. for predicting matches in 24/25 we wouldn't know a team's attendance 
+#from that season yet but we would know the attendance from 23/24. 
+#Label all the 23/24 stats as 24/25 so that they join to the 24/25 games
+data <- matches %>%
+  left_join(home_adv, by = c("home"="team","season"="season")) %>%
+  left_join(attendance, by = c("home"="team","season"="season")) %>%
+  left_join(attendance, by = c("away"="team","season"="season"),
+            suffix=c("_home","_away")) %>%
+  #change to a number so that it can be manipulated
+  mutate(season = as.numeric(substr(season,1,2))) %>%
+  #join fixture result from previous season if it exists
+  #missing this if one of the teams was promoted
+  mutate(prev_season = season - 1) %>%
+  left_join(matches %>%
+              mutate(season = as.numeric(substr(season,1,2))) %>%
+              select("season","home","away","result"),
+            by=c("prev_season"="season","home"="home","away"="away"), 
+            suffix = c("", "_prev")) %>%
+  select(-prev_season)
+```
+
+Within this data set, there are numerous missing values. Firstly, the 2011-12 season does not have betting odds. It is only included to calculate previous season statistics, so it can be removed now. Additionally, the first five matches each team plays every season are missing predictors since form statistics cannot yet be determined. These will be removed as well. Last, the previous matchup result predictor is missing some values due to rotation of teams in the league from the promotion/relegation system. Imputation of these values is discussed later.
+
+```{r remove data that is not used for modelling}
+data <- data %>%
+  #remove 11/12 season
+  filter(season != "11") %>%
+  #remove first 5 matches of season (form isn't calibrated)
+  filter(h_prev_result1 != "")
+```
+
+# Exploratory Data Analysis
+
+Before creating any models, it is helpful to understand how specific predictors affect the odds of the home team winning, drawing, or losing.
+
+```{r conditional win probability, echo=FALSE}
+home_win_predict <- data %>%
+  select(c(result,h_prev_result1,h_prev_result2,h_prev_result3)) %>%
+  count(prev_3 = paste0(h_prev_result1, h_prev_result2, h_prev_result3), result) %>%
+  mutate(pts = str_count(prev_3,'W')*3+str_count(prev_3,'D')) %>%
+  group_by(prev_3) %>%
+  mutate(prob = n / sum(n)) %>%
+  #order x axis by number of points in the last 3
+  arrange(pts)
+home_win_predict$prev_3 <- factor(home_win_predict$prev_3, 
+                                  levels = unique(home_win_predict$prev_3))
+
+ggplot(home_win_predict, aes(x = prev_3, y = prob, fill = factor(result,c("L","D","W")))) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Conditional Probabilities of W/D/L",
+       x = "Previous 3 Game Results",
+       y = "Probability of Home Result",
+       fill = "Result") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values=c("#e75757","grey","#3cb53c"))
+```
+
+As expected, a home team with a good record going into a game is much more likely to win, especially if they are coming off 3 wins in a row. Additionally, a win in the previous game increases odds relative to other permutations.
+
+```{r conditonal win probability, echo=FALSE}
+away_win_predict <- data %>%
+  select(c(result,a_prev_result1,a_prev_result2,a_prev_result3)) %>%
+  count(prev_3 = paste0(a_prev_result1, a_prev_result2, a_prev_result3), result) %>%
+  mutate(pts = str_count(prev_3,'W')*3+str_count(prev_3,'D')) %>%
+  group_by(prev_3) %>%
+  mutate(prob = n / sum(n)) %>%
+  group_by(prev_3) %>%
+  mutate(prob = n / sum(n)) %>%
+  #order x axis by number of points in last 3
+  arrange(pts)
+away_win_predict$prev_3 <- factor(away_win_predict$prev_3, 
+                                  levels = unique(away_win_predict$prev_3))
+
+#swap result so it is from away team's perspective
+away_win_predict$result[away_win_predict$result=='W'] <- 'J'
+away_win_predict$result[away_win_predict$result=='L'] <- 'W'
+away_win_predict$result[away_win_predict$result=='J'] <- 'L'
+
+ggplot(away_win_predict, aes(x = prev_3, y = prob, fill = factor(result,c("L","D","W")))) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Conditional Probabilities of W/D/L",
+       x = "Previous 3 Game Results",
+       y = "Probability of Away Team Result",
+       fill = "Result") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values=c("#e75757","grey","#3cb53c"))
+```
+
+A similar pattern can be observed for the away team, but with much lower win odds. This is because of the home team advantage in the Premier League.
+
+Home advantage can be measured by many different metrics. The best are points differential (league points earned at home minus league points eaarned on the road) and goal differential difference (home goal differential minus away goal differential). Both of these metrics are independent of opponent strength, which is useful since missing values for promoted teams can be filled with results from their 2nd tier season.
+
+```{r home advantage, echo=FALSE}
+homefield <- home_adv %>%
+  mutate(season = as.numeric(substr(season,1,2))) %>%
+  mutate(season = paste0(season - 1,"/",season)) %>%
+  group_by(season) %>%
+  summarise(Points = mean(pts_diff),
+            Goals = mean(gdd)) %>%
+  pivot_longer(cols=c(Points,Goals))
+
+ggplot(homefield, aes(fill=name, y=value, x=season)) + 
+    geom_bar(position="dodge", stat="identity") +
+    labs(title = "Home Advantage Over Time",
+         x = "Season",
+         y = "League Average Home Advantage",
+         fill = "Measurement")
+```
+
+These two metrics are very closely correlated, so it doesn't matter which one is used for modelling. One important pattern is that the 2020/21 and 2021/22 seasons have less home advantage due to COVID-19 lock-down restrictions. For the purpose of modelling, it is reasonable to remove these seasons as outliers so that home advantage is properly calibrated.
+
+```{r goal differential vs form, echo=FALSE}
+prediction_by_form <- data %>%
+  select(c(gd,form_diff))
+
+ggplot(data = prediction_by_form, aes(x=form_diff,y=gd)) +
+  geom_jitter(aes(colour = cut(gd, c(-Inf,-1,1,Inf)))) + 
+  labs(title = "Match Result vs Form Difference",
+       subtitle = "Note: points jittered to show overlap",
+       x = "Prev 5 games GD (H) - Prev 5 games GD (A)",
+       y = "Match GD") +
+  scale_color_manual(name="gd", 
+                     values=c("(-Inf,-1]"="#e75757","(-1,1]"="grey","(1, Inf]"="#3cb53c"),
+                     labels=c("Loss","Draw","Win"))
+```
+
+Form difference is correlated with match result but not very strongly.
+
+```{r win probability by previous fixture result, echo=FALSE} 
+fixture_repeat_prob <- data %>%
+  select(c(result,result_prev)) %>%
+  count(result_prev, result) %>%
+  group_by(result_prev) %>%
+  mutate(prob = n / sum(n))
+#reorder x axis
+fixture_repeat_prob$result_prev <- factor(fixture_repeat_prob$result_prev, 
+                                  levels = c("L","D","W"))
+
+ggplot(fixture_repeat_prob, aes(x = result_prev, y = prob, fill = factor(result,c("L","D","W")))) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Chance of Fixture Repeat",
+       x = "Previous Season Result",
+       y = "Probability of Home Result",
+       fill = "Result") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values=c("#e75757","grey","#3cb53c"))
+```
+
+The identical fixture between the two teams has some predictive power but it far from definitive. NA represents a match involving a promoted team. Because the two teams were in different leagues in the previous season, the matchup did not occur.
+
+```{r match significance, echo=FALSE}
+significant <- data %>%
+  select(c(result,significance)) %>%
+  count(significance, result) %>%
+  group_by(significance) %>%
+  mutate(prob = n / sum(n))
+
+ggplot(significant, aes(x = significance, y = prob, fill = factor(result,c("L","D","W")))) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = "Result by Match Significance",
+       x = "Significant For",
+       y = "Probability of Home Result",
+       fill = "Result") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values=c("#e75757","grey","#3cb53c"))
+```
+
+If a match is significant only for the home team, they are very likely to get a win and have more than an 80% chance of getting points. The away team's odds of winning (shown as a loss in the chart) also greatly increase from if the match significance is neutral.
+
+# Modelling Benchmarks
+
+Before creating any models, it is important to understand what would be considered "good" for model accuracy.
+
+The worst prediction strategy would be random choice, which would give 33% accuracy. 
+A slightly better, although still naive, method would be to always predict the home team to win for around 45% accuracy. The best performance out of single-predictor methods is taking the result with the lowest betting odds. By this statistic, the bookmakers have an accuracy around 56%. The confidence matrix for bookmaker predictions is shown below. 
+
+```{r accuracy of betting odds predictor, echo=FALSE}
+#betting odds
+betting <- data %>%
+  select(result,win_odds,draw_odds,loss_odds) %>%
+  mutate(result = as.factor(result)) %>%
+  mutate(prediction = as.factor(case_when(
+    #take lowest odds as prediction
+    win_odds < draw_odds & win_odds < loss_odds ~ "W",
+    draw_odds < win_odds & draw_odds < loss_odds ~ "D",
+    loss_odds < win_odds & loss_odds < draw_odds ~ "L",
+    TRUE ~ "D" #if odds are tied predict a draw
+  )))
+
+conf_mat(betting, truth = result, estimate = prediction) %>% 
+ autoplot(type = "heatmap")
+#accuracy(betting, truth=result, estimate=prediction)
+```
+
+Notice that even though 23% of matches end in draws, bookies only predicted draws in 25 matches.
+
+# Creating Models
+
+Firstly, I'm going to remove the 2020-21 and 2021-22 seasons from the dataset as outliers. I will also be imputing missing previous results by giving a win to whichever team had more home attendance in the previous season, which will usually be the team that was in the Premier League for the previous season.
+
+```{r create recipe}
+model_data <- data %>%
+  filter(season != 21 & season != 20) %>%
+  mutate(result_prev = case_when(
+  is.na(result_prev) & attendance_home > attendance_away ~ "W",
+  is.na(result_prev) & attendance_home < attendance_away ~ "L",
+  TRUE ~ result_prev
+  ))
+```
+
+This reduced dataset can then be split into training, testing, and validation stratified by result so that the model predicts an accurate proportion of wins, draws and losses. The purpose of this splitting is to avoid overfitting. If the model were trained and tested on a singular dataset, it can "overfit" meaning that the model perfectly matches the training data, but when it is used on new data, it will have high error. Cross-validation is an extra trick used to optimize model parameters, such as the penalty term, $\lambda$, in a lasso regression. The cross-validation algorithm for this situation is outlined below.  
+
+1. Divide the training data into $k$ partitions ($k=5$ is commonly used), called "folds".  
+
+2. For each value of $\lambda$:  
+
+  * Fit a model to each combination of $k-1$ folds  
+
+  * Test the model on the fold that was not used for training  
+
+  * Average the error on the $k$ different test folds  
+
+  * Save as the performance for $\lambda$  
+
+3. Select the best performing $\lambda$ and fit a model using the entire training set.
+
+To create the model recipe, some columns that were only included for human readability need to be removed from the data table and categorical predictors need to be dummy encoded. For now this will be a classification model, so the `gd` response variable is removed and I make the arbitrary choice of using `gdd` to estimate home advantage rather than `pts_diff`. Numeric predictors need to be normalized for the regression models because they use regularization methods.
+
+```{r}
+split <- initial_split(model_data, prop=0.7, strata=result)
+train <- training(split)
+test <- testing(split)
+folds <- vfold_cv(train, v=5, strata=result)
+
+recipe <- recipe(result ~ ., data=model_data) %>%
+  step_rm(c(date, season, home, away, gd, pts_diff)) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) 
+```
+
+## Multinomial Model
+
+Starting off simple, I will attempt to use a logistic regression model. Since classification is not binary, a standard logistic cannot be used, but the multinomial extension will work perfectly for three classes.
+
+```{r create models}
+multinom_mod <- multinom_reg("penalty" = tune(),
+                             "mixture" = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+```
+
+```{r tune and fit multinomial, warning=FALSE}
+m_wflow <- workflow() %>%
+  add_model(multinom_mod) %>%
+  add_recipe(recipe)
+
+mn_tune_grid <- grid_regular(penalty(range = c(-3,-0.5)),
+                          mixture(range = c(0,1)),
+                          levels=8)
+
+mn_tune <- tune_grid(m_wflow,
+                     resamples = folds,
+                     grid = mn_tune_grid,
+                     metrics = metric_set(yardstick::accuracy))
+
+best_params <- select_best(mn_tune)
+final_mn <- finalize_workflow(m_wflow, best_params)
+
+multinom_fit <- fit(final_mn, train)
+
+autoplot(mn_tune)
+```
+
+It can be seen that an elastic net model with $\lambda \approx 0.026$ performs best in cross-validation of the training set with an accuracy around 0.57.
+
+## Boost Tree Model
+
+Next classification model I will use is a boost tree, tuning for the number of trees, minimum node size, and learning rate.
+
+```{r}
+btree_mod <- boost_tree("trees" = tune(),
+                        "min_n" = tune(),
+                        "learn_rate" = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+```{r}
+bt_wflow <- workflow() %>%
+  add_model(btree_mod) %>%
+  add_recipe(recipe)
+```
+
+```{r tune and fit boost tree, eval=FALSE}
+bt_tune_grid <- grid_regular(trees(range = c(3, 50)),
+                          min_n(range = c(5,28)),
+                          learn_rate(range = c(0.005,0.1)),
+                          levels=8)
+
+bt_tune <- tune_grid(bt_wflow,
+                     resamples = folds,
+                     grid = bt_tune_grid,
+                     metrics = metric_set(accuracy))
+
+save(bt_tune, file = "boost_tree_model.rda")
+```
+
+```{r save model, warning=FALSE}
+load("boost_tree_model.rda")
+
+autoplot(bt_tune)
+
+best_params <- select_best(bt_tune)
+final_bt <- finalize_workflow(bt_wflow, best_params)
+
+boost_tree_fit <- fit(final_bt, train)
+```
+
+Using more predictors alwaus performs better but there is a tradeoff between number of trees and learning rate. I chose to do less trees with a slower learning rate. Overall, this model always does significantly worse than our benchmark of 56% accuracy, so no further development will be done.
+
+## Random Forest
+
+An alternative tree based model is the random forest.
+
+```{r}
+rf_mod <- rand_forest("mtry" = tune(),
+                      "trees" = tune(),
+                      "min_n" = tune()) %>%
+  set_engine("ranger", "importance" = "impurity") %>%
+  set_mode("classification")
+```
+
+```{r}
+rf_wflow <- workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(recipe)
+```
+
+```{r tune and fit random forest, eval=FALSE}
+
+
+rf_tune_grid <- grid_regular(trees(range = c(80, 400)),
+                          mtry(range = c(3,10)),
+                          min_n(range = c(2,50)),
+                          levels=8)
+
+rf_tune <- tune_grid(rf_wflow,
+                     resamples = folds,
+                     grid = rf_tune_grid,
+                     metrics = metric_set(accuracy))
+
+save(rf_tune, file = "rf_model.rda")
+```
+
+```{r save forest model, warning=FALSE}
+load('rf_model.rda')
+
+autoplot(rf_tune)
+
+best_params <- select_best(rf_tune)
+final_bt <- finalize_workflow(rf_wflow, best_params)
+
+random_forest_fit <- fit(final_bt, train)
+```
+
+Any number of trees over 50 performed well, but the best results were found when using small samples of predictors. Accuracy around 56% on the best model makes this a good candidate for a final model.
+
+## Regression Model, Manually Classified
+
+An alternative approach to the classification problem is to predict the goal differential of a match. If it is within some margin of 0, it can be classified as a draw. If it is sufficiently positive it can be classified as a win. If it is sufficiently below zero it can be classified as a loss.  
+
+The recipe needs to be changed so that goal differential is the response and result is not a predictor.
+
+```{r fit a regression model}
+regression_recipe <- recipe(gd ~ ., data=model_data) %>%
+  step_rm(c(date, season, home, away, result, pts_diff)) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+From there, an elastic net linear regression can be created and trained, cross validating for the penalty and mixture hyperparameters.
+
+```{r, warning=FALSE}
+regression_mod <- linear_reg("penalty" = tune(),
+                             "mixture" = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+lr_wflow <- workflow() %>%
+  add_model(regression_mod) %>%
+  add_recipe(regression_recipe)
+
+lr_tune_grid <- grid_regular(penalty(range = c(-3.5,-0.4)),
+                          mixture(range = c(0,1)),
+                          levels=8)
+
+lr_tune <- tune_grid(lr_wflow,
+                     resamples = folds,
+                     grid = lr_tune_grid)
+
+best_params <- select_best(lr_tune)
+final_lr <- finalize_workflow(lr_wflow, best_params)
+
+linear_fit <- fit(final_lr, train)
+
+autoplot(lr_tune)
+```
+
+The ideal hyperparameters are very similar to our prior classification model.
+
+Next, a margin of goal differential for classifying draws needs to be determined. The procedure I used it as follows. Starting with classifying all results as either a win or a loss (margin = 0), the margin expands up until $0\pm 3$ is classified as a draw. For each of these margins, the accuracy of classification will be checked. A plot of margin vs accuracy is shown below.
+
+```{r categorize gd, echo=FALSE}
+regression_training <- augment(linear_fit, train) %>%
+  mutate(result = as.factor(result))
+
+categorize <- function(margin) {
+  categorized <- regression_training %>%
+    mutate(prediction = case_when(
+    .pred > margin ~ "W",
+    .pred < -margin ~ "L",
+    TRUE ~ "D" #if within margin predict a draw
+  )) %>%
+    mutate(prediction = factor(prediction,levels=c("D","L","W")))
+    
+  accuracy(categorized, truth=result, estimate=prediction) %>%
+      select(.estimate) %>%
+      pull()
+}
+
+margin <- seq(0, 3, by=0.1)
+prob <- lapply(margin, categorize)
+plot(margin,prob, ylab="Accuracy",type='l')
+```
+
+Surprisingly, the best margin is 0. In other words, when optimizing for accuracy, it is best to only classify matches as wins or losses, never as draws. This yields an accuracy of 56.8% on the training data, which is very good.
+
+# Model Testing
+
+The best performing models were the random forest and the manually classified linear regression. How to these two fare on the actual 
+
+```{r, echo=FALSE}
+rf_results <- augment(random_forest_fit, test) %>%
+  mutate(result = as.factor(result))
+
+conf_mat(rf_results, truth = result, estimate = .pred_class) %>% 
+ autoplot(type = "heatmap")
+```
+
+The random forest classifies about as many matches as draws as the bookmakers did and it gets a very similar accuracy.
+
+```{r, echo=FALSE}
+accuracy(rf_results, truth=result, estimate=.pred_class)
+```
+
+The ranking of importance for variables is shown below.
+
+```{r, echo=FALSE}
+vip(random_forest_fit,num_features=27)
+```
+
+Unsurprisingly, the most useful predictors are the betting odds. Interestingly, average attendance size is the next most useful. My best guess is that this relatively obscure statistic isn't part of the bookmaker model, so it gives a slight edge.
+
+```{r, echo=FALSE}
+regression_results <- augment(linear_fit, test) %>%
+  mutate(result = as.factor(result)) %>%
+  mutate(.pred_class = case_when(
+    .pred > 0 ~ "W",
+    .pred < 0 ~ "L",
+    TRUE ~ "D" #won't happen unless prediction is 0
+  )) %>%
+  mutate(.pred_class = factor(.pred_class,levels=c("D","L","W")))
+
+conf_mat(regression_results, truth = result, estimate = .pred_class) %>% 
+ autoplot(type = "heatmap")
+```
+
+As decided earlier, the model is set to not classify any matches as draws.
+
+```{r}
+accuracy(regression_results, truth=result, estimate=.pred_class)
+```
+
+Out of these two models it is hard to say which is preferred. Obviously the regression model has better test accuracy, but it does not give probabilities of each classification like the random forest model does. For this reason, it cannot be used to set match odds or implement any complex betting strategy.
+
+# Further Findings: Predicting without Betting Odds
+
+The betting odds do a lot of heavy lifting. Theoretically, they were calculated using much more detailed training data than I was able to collect. Modelling without them should give an idea of how closely I was able to approximate the bookmaker's model.
+
+```{r no odds recipe}
+no_odds_recipe <- recipe(result ~ ., data=model_data) %>%
+  step_rm(c(date, season, home, away, gd, pts_diff,win_odds,draw_odds,loss_odds)) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+```
+
+```{r, warning=FALSE}
+m_wflow <- workflow() %>%
+  add_model(multinom_mod) %>%
+  add_recipe(no_odds_recipe)
+
+mn_tune_grid <- grid_regular(penalty(range = c(-3,-0.5)),
+                          mixture(range = c(0,1)),
+                          levels=8)
+
+mn_tune <- tune_grid(m_wflow,
+                     resamples = folds,
+                     grid = mn_tune_grid,
+                     metrics = metric_set(yardstick::accuracy))
+
+best_params <- select_best(mn_tune)
+final_mn <- finalize_workflow(m_wflow, best_params)
+
+no_odds_fit <- fit(final_mn, train)
+```
+
+```{r}
+no_odds_results <- augment(no_odds_fit, test) %>%
+  mutate(result = as.factor(result))
+
+conf_mat(no_odds_results, truth = result, estimate = .pred_class) %>% 
+ autoplot(type = "heatmap")
+accuracy(no_odds_results, truth=result, estimate=.pred_class)
+```
+
+The predictors I collected are able to predict match results with almost 53% accuracy.
+
+# Conclusions
+
+While the regression model with betting odds is the best performing and outperforms the 56% benchmark mentioned earlier, this slight edge is not enough to consistently provide winnings. For one, across specific seasons, bookmakers have had as low as 51% accuracy and as high as 61% accuracy. Additionally, transaction fees and the bookmaker's margin mean a much larger edge than this is needed for betting to be profitable. While the model is very effective, much more rigorous testing would be required to determine if it has a long-term advantage. 
+
+### Future Development
+
+There are a many small improvements to the model that could be made at the expense of time. These include:
+
+* Add results of non-Premier league games - all teams play competitive games that are not included in this data set such as the Champions League, Europa League, and FA Cup. Inclusion of these matches, if done correctly, could increase the accuracy of form statistics and make it viable to generate additional predictors regarding rest and travel.
+* Account for absense of significant players - the model attempts to account for missing players with the red and yellow card predictors, but does not account of injuries or how important the player is to the team. For example, a team could have their top goal scorer or best defender missing due to injury and the model would predict as if they were there. 
+* More data, weighted for recency - I chose to start training with data from 2012 with the assumption that old matches will be worse for predicting matches in 2024 than more recent games. Model performance could be improved with older match results, as long as the necessary predictors can still be extracted, but the model should still favor fitting to more recent matches.
+* Improved algorithm for match significance - Determining if team is in contention for a position or not is a very complicated problem^6^. I simplified it by not considering other team's results, but implementing a more complicated algorithm would improve the significance of this predictor.
+
+Additionally, testing in comparison to betting odds was done as if a single result had to be chosen for every match and and each prediction was 100% confident. More sophisticated betting strategies using prediction confidence could help amplify the model's 1% edge to something that yields more consistent payouts.
+
+# References
+
+^1^ https://www.statista.com/outlook/amo/online-gambling/online-sports-betting/united-states  
+
+^2^ https://www.statista.com/topics/6133/betting-industry-in-the-uk/
+
+^3^ https://www.football-data.co.uk/englandm.php  
+
+^4^ https://fbref.com/en/  
+
+^5^ https://www.football365.com  
+
+^6^ https://www.degruyter.com/document/doi/10.1515/9781400869930-023/html
