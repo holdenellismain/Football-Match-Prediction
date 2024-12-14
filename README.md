@@ -76,7 +76,22 @@ The linear regression model has a very similar variable importance plot
 
 ![000014](https://github.com/user-attachments/assets/76740a93-59ef-4eb2-81f5-59d44bc03c74)
 
-One interesting thing is that is uses 
+One interesting thing is that the model puts a lot of weight in the match significance predictor, which was almost never used by the random forest model. This is odd because significance is undoubtedly an important predictor, which can be seen by via the home team's conditional win probability.
+
+![000050](https://github.com/user-attachments/assets/bb893026-411a-4e6e-91ad-ad49a20e745a)
+
+### Future Development
+
+There are a many small improvements to the model that could be made at the expense of time. These include:
+
+- Add results of non-Premier league games - all teams play competitive games that are not included in this data set such as the Champions League, Europa League, and FA Cup. Inclusion of these matches, if done correctly, could increase the accuracy of form statistics and make it viable to generate additional predictors regarding rest and travel.
+- Account for absence of significant players - the model attempts to account for missing players with the red and yellow card predictors, but does not account of injuries or how important the player is to the team. For example, a team could have their top goal scorer or best defender missing due to injury and the model would predict as if they were there. 
+- More data, weighted for recency - I chose to start training with data from 2012 with the assumption that old matches will be worse for predicting matches in 2024 than more recent games. Model performance could be improved with older match results, as long as the necessary predictors can still be extracted, but the model should still favor fitting to more recent matches.
+- Improved algorithm for match significance - Determining if team is in contention for a position or not is a very complicated problem^6^. I simplified it by not considering other team's results, but implementing  more complicated algorithm would improve the significance of this predictor.
+
+It could also be interesting to use the inferential ability of these machine learning models to design a more complex betting strategy. These models were optimized off the assumption that a prediction of win, draw, or loss needs to be made for every match but there is surely a more nuanced way to predict that increases payout.
+
+Additionally, testing in comparison to betting odds was done as if a single result had to be chosen for every match and and each prediction was 100% confident. More sophisticated betting strategies using prediction confidence could help amplify the model's 1% edge to something that yields more consistent payouts.
 
 
 
