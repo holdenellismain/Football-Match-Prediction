@@ -22,7 +22,7 @@ Code used for Steps 1 and 2 can be found in [data_collection.ipynb](code/data_co
    - Match results were scraped from [FBref](https://fbref.com/en/)
    - League tables were scraped from [Football365](https://www.football365.com)
 2. Data was loaded into Python and processed using the [classes.py](code/classes.py) OOP structure so that every match had predictor statistics based on previous matches.The result of this is a partial dataset [tmp3.csv](data/tmp3.csv)
-Code for the steps below can be found in [models.rmd](code/models.rmd)
+Code for the steps below, along with more visualizations, can be found in [models.rmd](code/models.rmd)
 3. Data was loaded into R and joins were used to combine [the partial dataset](data/tmp3.csv), [attendance stats](data/attendance.csv), [home advantage stats](data/home_strength.csv), and the previous fixture result. This created the final dataset described in the [codebook](codebook.pdf)
 4. Further process the dataset to remove outliers, impute missing values, dummy encode nominal predictors, and normalize numeric predictors.
 5. Fit models on training folds
@@ -80,7 +80,7 @@ One interesting thing is that the model puts a lot of weight in the match signif
 
 ![000050](https://github.com/user-attachments/assets/bb893026-411a-4e6e-91ad-ad49a20e745a)
 
-### Future Development
+## Future Development
 
 There are a many small improvements to the model that could be made at the expense of time. These include:
 
@@ -92,6 +92,3 @@ There are a many small improvements to the model that could be made at the expen
 It could also be interesting to use the inferential ability of these machine learning models to design a more complex betting strategy. These models were optimized off the assumption that a prediction of win, draw, or loss needs to be made for every match but there is surely a more nuanced way to predict that increases payout.
 
 Additionally, testing in comparison to betting odds was done as if a single result had to be chosen for every match and and each prediction was 100% confident. More sophisticated betting strategies using prediction confidence could help amplify the model's 1% edge to something that yields more consistent payouts.
-
-
-
